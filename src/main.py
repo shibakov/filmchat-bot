@@ -14,27 +14,35 @@ cur = conn.cursor()
 cur.execute("""
 CREATE TABLE IF NOT EXISTS messages (
     id SERIAL PRIMARY KEY,
-    username TEXT,
+    message_id BIGINT,
+    chat_id BIGINT,
+    chat_title TEXT,
     user_id BIGINT,
+    username TEXT,
     text TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
 """)
 conn.commit()
 
-# Обработка сообщений
 async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    text = update.message.text
+    if not update.message:
+        return
 
-    # Сохраняем сообщение
+    msg = update.message
+    user = msg.from_user
+    chat = msg.chat
+
     cur.execute(
-        "INSERT INTO messages (username, user_id, text) VALUES (%s, %s, %s)",
-        (user.username, user.id, text)
+        """
+        INSERT INTO messages (message_id, chat_id, chat_title, user_id, username, text)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        """,
+        (msg.message_id, chat.id, chat.title, user.id, user.username, msg.text)
     )
     conn.commit()
 
-    await update.message.reply_text(f"Принято: {text}")
+    print(f"[{chat.title}] @{user.username}: {msg.text}")
 
 app = ApplicationBuilder().token(os.getenv("BOT_TOKEN")).build()
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
