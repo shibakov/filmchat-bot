@@ -197,8 +197,8 @@ async def shutdown(app):
             print(f"Error closing database connections: {e}")
         print("Bot stopped successfully")
 
-async def main():
-    """Основная функция запуска бота"""
+async def run_bot():
+    """Запуск бота с обработкой сигналов"""
     app = None
     try:
         # Создаем приложение
@@ -206,6 +206,14 @@ async def main():
         
         # Добавляем обработчик сообщений
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+        
+        # Настраиваем обработчики сигналов
+        loop = asyncio.get_running_loop()
+        for signal_type in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(
+                signal_type,
+                lambda: asyncio.create_task(shutdown(app))
+            )
         
         print("Starting bot...")
         await app.initialize()
@@ -217,34 +225,16 @@ async def main():
         
     except Exception as e:
         print(f"Error starting bot: {e}")
+        if app:
+            await shutdown(app)
     finally:
         if app:
             await shutdown(app)
 
 if __name__ == "__main__":
     try:
-        # Получаем или создаем event loop
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        
-        # Добавляем обработчики сигналов
-        for signal_type in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(
-                signal_type,
-                lambda: asyncio.create_task(shutdown(app))
-            )
-        
-        # Запускаем основной цикл
-        loop.run_until_complete(main())
+        asyncio.run(run_bot())
     except KeyboardInterrupt:
         print("Bot stopped by user")
     except Exception as e:
-        print(f"Fatal error: {e}")
-    finally:
-        try:
-            loop.close()
-        except Exception as e:
-            print(f"Error closing event loop: {e}") 
+        print(f"Fatal error: {e}") 
