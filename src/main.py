@@ -38,21 +38,16 @@ class TelegramLogHandler(logging.Handler):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
-        # Create bot instance for this thread
-        bot = Bot(self.bot_token)
-        
         async def send_message(msg):
             try:
-                async with aiohttp.ClientSession() as session:
-                    await bot.initialize(session)
-                    await bot.send_message(
-                        chat_id=self.channel_id,
-                        text=f"🤖 Log [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]:\n{msg}"
-                    )
+                # Create new bot instance for each message
+                bot = Bot(self.bot_token)
+                await bot.send_message(
+                    chat_id=self.channel_id,
+                    text=f"🤖 Log [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]:\n{msg}"
+                )
             except Exception as e:
                 print(f"Error sending log to Telegram: {e}")
-            finally:
-                await bot.shutdown()
 
         while self.running:
             try:
