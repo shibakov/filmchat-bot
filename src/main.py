@@ -2,15 +2,24 @@ import os
 import json
 import openai
 import psycopg2
+import asyncio
+import signal
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 from dotenv import load_dotenv
+from pathlib import Path
 
-load_dotenv()
+# Загружаем .env только если файл существует
+env_path = Path('.env')
+if env_path.exists():
+    load_dotenv()
 
 openai.api_key = os.getenv("OPENAI_API_KEY")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
+
+if not all([openai.api_key, BOT_TOKEN, DATABASE_URL]):
+    raise ValueError("Необходимые переменные окружения не установлены")
 
 # Подключение к БД
 conn = psycopg2.connect(DATABASE_URL)
@@ -170,6 +179,46 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"Error processing message: {e}")
         await status_message.edit_text("❌ Произошла ошибка при обработке сообщения")
 
-app = ApplicationBuilder().token(BOT_TOKEN).build()
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
-app.run_polling() 
+async def shutdown(app):
+    """Корректное завершение работы бота"""
+    print("Stopping bot...")
+    try:
+        await app.stop()
+    finally:
+        cur.close()
+        conn.close()
+        print("Bot stopped successfully")
+
+async def main():
+    """Основная функция запуска бота"""
+    # Создаем приложение
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    
+    # Добавляем обработчик сообщений
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    
+    # Настраиваем корректное завершение работы
+    loop = asyncio.get_event_loop()
+    for signal_type in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(
+            signal_type,
+            lambda: asyncio.create_task(shutdown(app))
+        )
+    
+    try:
+        print("Starting bot...")
+        await app.initialize()
+        await app.start()
+        await app.run_polling(stop_signals=None)
+    except Exception as e:
+        print(f"Error starting bot: {e}")
+    finally:
+        await shutdown(app)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Bot stopped by user")
+    except Exception as e:
+        print(f"Fatal error: {e}") 
