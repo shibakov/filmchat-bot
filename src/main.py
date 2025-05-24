@@ -13,6 +13,11 @@ from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTyp
 from dotenv import load_dotenv
 from datetime import datetime
 
+# Импорт TelegramLogHandler
+TELEGRAM_LOG_CHANNEL_ID = os.getenv("TELEGRAM_LOG_CHANNEL_ID")
+if TELEGRAM_LOG_CHANNEL_ID:
+    from src.telegram_log_handler import TelegramLogHandler
+
 # Настройка логирования
 logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -23,6 +28,15 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# Добавляем Telegram handler если указан ID канала
+if TELEGRAM_LOG_CHANNEL_ID:
+    BOT_TOKEN = os.getenv("BOT_TOKEN")
+    telegram_handler = TelegramLogHandler(BOT_TOKEN, TELEGRAM_LOG_CHANNEL_ID)
+    telegram_handler.setLevel(logging.INFO)
+    telegram_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s\n%(message)s'))
+    logger.addHandler(telegram_handler)
+    logger.info("✅ Логирование в Telegram канал активировано")
 
 # Загрузка .env
 env_path = Path('.env')
