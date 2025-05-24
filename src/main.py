@@ -6,29 +6,112 @@ import asyncio
 import logging
 import sys
 import signal
+import traceback
 from pathlib import Path
-from telegram import Update
+from telegram import Update, Bot
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 from dotenv import load_dotenv
+from logging.handlers import QueueHandler
+from queue import Queue
+import asyncio
+from functools import partial
 
-# Логирование
+class TelegramLogHandler(logging.Handler):
+    def __init__(self, bot_token, channel_id):
+        super().__init__()
+        self.bot = Bot(bot_token)
+        self.channel_id = channel_id
+        self.queue = Queue()
+        self.task = None
+        
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            self.queue.put(msg)
+            
+            # Запускаем отправку асинхронно, если еще не запущена
+            if self.task is None or self.task.done():
+                self.task = asyncio.create_task(self.process_queue())
+        except Exception:
+            self.handleError(record)
+    
+    async def process_queue(self):
+        while not self.queue.empty():
+            messages = []
+            current_message = ""
+            
+            # Собираем сообщения в пачки, не превышающие лимит Telegram
+            while not self.queue.empty():
+                msg = self.queue.get()
+                if len(current_message) + len(msg) + 2 > 4000:  # Лимит Telegram
+                    messages.append(current_message)
+                    current_message = msg
+                else:
+                    current_message += msg + "\n"
+            
+            if current_message:
+                messages.append(current_message)
+            
+            # Отправляем каждую пачку
+            for message in messages:
+                try:
+                    await self.bot.send_message(
+                        chat_id=self.channel_id,
+                        text=f"```\n{message}\n```",
+                        parse_mode='Markdown'
+                    )
+                except Exception as e:
+                    sys.stderr.write(f"Error sending log to Telegram: {e}\n")
+                await asyncio.sleep(0.5)  # Небольшая задержка между сообщениями
+
+# Настройка логирования
+TELEGRAM_LOG_CHANNEL_ID = os.getenv("TELEGRAM_LOG_CHANNEL_ID")
+
 logging.basicConfig(
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('bot.log')
+    ]
 )
+
 logger = logging.getLogger(__name__)
 
 # .env (если есть)
 env_path = Path('.env')
 if env_path.exists():
     load_dotenv()
+    logger.info("✅ Файл .env загружен")
+else:
+    logger.warning("⚠️ Файл .env не найден")
 
+# Проверка и загрузка переменных окружения
 openai.api_key = os.getenv("OPENAI_API_KEY")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+# Добавляем Telegram handler если указан ID канала
+if TELEGRAM_LOG_CHANNEL_ID:
+    telegram_handler = TelegramLogHandler(BOT_TOKEN, TELEGRAM_LOG_CHANNEL_ID)
+    telegram_handler.setLevel(logging.INFO)
+    telegram_handler.setFormatter(logging.Formatter(
+        '%(asctime)s - %(levelname)s\n%(message)s'
+    ))
+    logger.addHandler(telegram_handler)
+    logger.info("✅ Логирование в Telegram канал активировано")
+else:
+    logger.warning("⚠️ TELEGRAM_LOG_CHANNEL_ID не указан, логи не будут отправляться в Telegram")
+
+logger.info("🔑 Проверка переменных окружения:")
+logger.info(f"- OPENAI_API_KEY: {'✅ установлен' if openai.api_key else '❌ отсутствует'}")
+logger.info(f"- BOT_TOKEN: {'✅ установлен' if BOT_TOKEN else '❌ отсутствует'}")
+logger.info(f"- DATABASE_URL: {'✅ установлен' if DATABASE_URL else '❌ отсутствует'}")
+logger.info(f"- TELEGRAM_LOG_CHANNEL_ID: {'✅ установлен' if TELEGRAM_LOG_CHANNEL_ID else '❌ отсутствует'}")
+
 if not all([openai.api_key, BOT_TOKEN, DATABASE_URL]):
-    raise ValueError("❌ Не найдены переменные окружения")
+    logger.error("❌ Не найдены необходимые переменные окружения")
+    raise ValueError("❌ Не найдены необходимые переменные окружения")
 
 # Глобальная БД
 conn = None
@@ -36,34 +119,47 @@ cur = None
 
 async def setup_database():
     global conn, cur
-    conn = psycopg2.connect(DATABASE_URL)
-    cur = conn.cursor()
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS movies_info (
-        id SERIAL PRIMARY KEY,
-        original_message TEXT,
-        title TEXT,
-        year INT,
-        genres TEXT,
-        actors TEXT,
-        kinopoisk_rating FLOAT,
-        kinopoisk_link TEXT,
-        imdb_rating FLOAT,
-        imdb_link TEXT,
-        poster_url TEXT,
-        added_by TEXT,
-        chat_id BIGINT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-    """)
-    conn.commit()
-    logger.info("✅ Таблица создана")
+    try:
+        logger.info("🔄 Подключение к базе данных...")
+        conn = psycopg2.connect(DATABASE_URL)
+        cur = conn.cursor()
+        
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS movies_info (
+            id SERIAL PRIMARY KEY,
+            original_message TEXT,
+            title TEXT,
+            year INT,
+            genres TEXT,
+            actors TEXT,
+            kinopoisk_rating FLOAT,
+            kinopoisk_link TEXT,
+            imdb_rating FLOAT,
+            imdb_link TEXT,
+            poster_url TEXT,
+            added_by TEXT,
+            chat_id BIGINT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+        conn.commit()
+        logger.info("✅ База данных успешно инициализирована")
+    except Exception as e:
+        logger.error(f"❌ Ошибка при инициализации БД: {e}")
+        logger.error(traceback.format_exc())
+        raise
 
 async def cleanup_database():
     global conn, cur
-    if cur: cur.close()
-    if conn: conn.close()
-    logger.info("✅ Соединение с БД закрыто")
+    try:
+        if cur: 
+            cur.close()
+        if conn: 
+            conn.close()
+        logger.info("✅ Соединение с БД закрыто")
+    except Exception as e:
+        logger.error(f"❌ Ошибка при закрытии соединения с БД: {e}")
+        logger.error(traceback.format_exc())
 
 async def analyze_film_text(text):
     prompt = f"""
@@ -88,14 +184,23 @@ async def analyze_film_text(text):
 Обязательно найди ссылки на IMDb и Кинопоиск.
 """
     try:
+        logger.info("🤖 Отправка запроса к GPT...")
+        logger.debug(f"Текст запроса: {text}")
+        
         response = await openai.ChatCompletion.acreate(
             model="gpt-4",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.7
         )
-        return json.loads(response.choices[0].message.content.strip())
+        
+        result = response.choices[0].message.content.strip()
+        logger.info("✅ Получен ответ от GPT")
+        logger.debug(f"Ответ GPT: {result}")
+        
+        return json.loads(result)
     except Exception as e:
-        logger.error(f"OpenAI error: {e}")
+        logger.error(f"❌ Ошибка при обработке GPT запроса: {e}")
+        logger.error(traceback.format_exc())
         return {"error": "gpt_fail"}
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -105,42 +210,56 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     chat = update.effective_chat
     user = update.effective_user
-    logger.info(f"📥 {chat.title or chat.id} / @{user.username}: {text}")
+    
+    logger.info(f"📥 Сообщение от {chat.title or chat.id} / @{user.username}")
+    logger.debug(f"Текст сообщения: {text}")
 
     if not any(k in text.lower() for k in ["фильм", "кино", "movie", "film", "предлагаю", "рекомендую"]):
         return
 
-    status = await update.message.reply_text("🎬 Анализирую фильм...", quote=True)
-    result = await analyze_film_text(text)
+    try:
+        status = await update.message.reply_text("🎬 Анализирую фильм...", quote=True)
+        logger.info("🔄 Начало анализа фильма")
+        
+        result = await analyze_film_text(text)
+        
+        if "error" in result:
+            error_msg = "❌ GPT не смог распознать фильм"
+            logger.warning(error_msg)
+            await status.edit_text(error_msg)
+            return
 
-    if "error" in result:
-        await status.edit_text("❌ GPT не смог распознать фильм")
-        return
+        logger.info(f"✅ Фильм распознан: {result['title']} ({result['year']})")
+        
+        try:
+            cur.execute("""
+                INSERT INTO movies_info (
+                    original_message, title, year, genres, actors,
+                    kinopoisk_rating, kinopoisk_link,
+                    imdb_rating, imdb_link, poster_url,
+                    added_by, chat_id
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                text,
+                result["title"],
+                result["year"],
+                ", ".join(result["genres"]),
+                ", ".join(result["actors"]),
+                result["kinopoisk_rating"],
+                result["kinopoisk_link"],
+                result["imdb_rating"],
+                result["imdb_link"],
+                result["poster_url"],
+                user.username,
+                chat.id
+            ))
+            conn.commit()
+            logger.info("✅ Информация сохранена в БД")
+        except Exception as e:
+            logger.error(f"❌ Ошибка при сохранении в БД: {e}")
+            logger.error(traceback.format_exc())
 
-    cur.execute("""
-        INSERT INTO movies_info (
-            original_message, title, year, genres, actors,
-            kinopoisk_rating, kinopoisk_link,
-            imdb_rating, imdb_link, poster_url,
-            added_by, chat_id
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-    """, (
-        text,
-        result["title"],
-        result["year"],
-        ", ".join(result["genres"]),
-        ", ".join(result["actors"]),
-        result["kinopoisk_rating"],
-        result["kinopoisk_link"],
-        result["imdb_rating"],
-        result["imdb_link"],
-        result["poster_url"],
-        user.username,
-        chat.id
-    ))
-    conn.commit()
-
-    caption = f"""🎬 *{result["title"]}* ({result["year"]})
+        caption = f"""🎬 *{result["title"]}* ({result["year"]})
 
 👤 *Актёры:* {", ".join(result["actors"])}
 🎭 *Жанры:* {", ".join(result["genres"])}
@@ -149,23 +268,38 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 📎 Предложил: @{user.username}
 """
-    try:
-        await update.message.reply_photo(
-            photo=result["poster_url"],
-            caption=caption,
-            parse_mode="Markdown"
-        )
-        await status.delete()
-    except:
-        await status.edit_text(caption + "\n\n⚠️ Постер не удалось загрузить", parse_mode="Markdown")
+        try:
+            await update.message.reply_photo(
+                photo=result["poster_url"],
+                caption=caption,
+                parse_mode="Markdown"
+            )
+            await status.delete()
+            logger.info("✅ Ответ с постером отправлен")
+        except Exception as e:
+            logger.error(f"❌ Ошибка при отправке постера: {e}")
+            logger.error(traceback.format_exc())
+            await status.edit_text(caption + "\n\n⚠️ Постер не удалось загрузить", parse_mode="Markdown")
+            
+    except Exception as e:
+        error_msg = f"❌ Произошла ошибка при обработке сообщения: {str(e)}"
+        logger.error(error_msg)
+        logger.error(traceback.format_exc())
+        await status.edit_text(error_msg)
 
 async def run_bot():
-    await setup_database()
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
-    logger.info("🚀 Бот запущен")
-    await app.run_polling()
-    await cleanup_database()
+    try:
+        await setup_database()
+        app = ApplicationBuilder().token(BOT_TOKEN).build()
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+        
+        logger.info("🚀 Бот запущен")
+        await app.run_polling()
+    except Exception as e:
+        logger.error(f"❌ Критическая ошибка: {e}")
+        logger.error(traceback.format_exc())
+    finally:
+        await cleanup_database()
 
 if __name__ == "__main__":
     import nest_asyncio
@@ -173,4 +307,5 @@ if __name__ == "__main__":
     try:
         asyncio.run(run_bot())
     except Exception as e:
-        logger.error(f"FATAL: {e}") 
+        logger.error(f"FATAL: {e}")
+        logger.error(traceback.format_exc()) 
