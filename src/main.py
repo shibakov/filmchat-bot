@@ -1,3 +1,4 @@
+# Updated: Sat May 24 12:00:48 +04 2025
 # This file was updated on Sat May 24 11:55:47 +04 2025
 import os
 import psycopg2
@@ -37,7 +38,7 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur.execute(
         """
         INSERT INTO messages (message_id, chat_id, chat_title, user_id, username, text)
-        VALUES (%s, %s, %s, %s, %s, %s)
+        VALUES (, , , , , )
         """,
         (msg.message_id, chat.id, chat.title, user.id, user.username, msg.text)
     )
