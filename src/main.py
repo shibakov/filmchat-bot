@@ -91,15 +91,25 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-# .env (если есть)
+# Загрузка .env
 env_path = Path('.env')
 if env_path.exists():
     load_dotenv()
-    logger.info("✅ Файл .env загружен")
-else:
-    logger.warning("⚠️ Файл .env не найден")
+    logger.info("✅ Конфигурация загружена")
 
 # Проверка и загрузка переменных окружения
+REQUIRED_ENV_VARS = {
+    "OPENAI_API_KEY": "OpenAI API ключ",
+    "BOT_TOKEN": "Telegram бот токен",
+    "DATABASE_URL": "URL базы данных"
+}
+
+missing_vars = [name for name in REQUIRED_ENV_VARS.keys() if not os.getenv(name)]
+if missing_vars:
+    missing_list = "\n".join(f"- {name}: {REQUIRED_ENV_VARS[name]}" for name in missing_vars)
+    logger.error(f"❌ Отсутствуют обязательные переменные окружения:\n{missing_list}")
+    raise ValueError("Отсутствуют обязательные переменные окружения")
+
 openai.api_key = os.getenv("OPENAI_API_KEY")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -237,12 +247,12 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = await analyze_film_text(text)
         
         if "error" in result:
-            error_msg = "❌ GPT не смог распознать фильм"
+            error_msg = "❌ Не удалось распознать фильм в сообщении"
             logger.warning(error_msg)
             await status.edit_text(error_msg)
             return
 
-        logger.info(f"✅ Фильм распознан: {result['title']} ({result['year']})")
+        logger.info(f"✅ Распознан фильм: {result['title']} ({result['year']})")
         
         try:
             cur.execute("""
@@ -271,6 +281,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"❌ Ошибка при сохранении в БД: {e}")
             logger.error(traceback.format_exc())
+            await status.edit_text("❌ Ошибка сохранения информации")
+            return
 
         caption = f"""🎬 *{result["title"]}* ({result["year"]})
 
@@ -279,8 +291,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ⭐️ КиноПоиск: {result["kinopoisk_rating"]} — [ссылка]({result["kinopoisk_link"]})
 ⭐️ IMDb: {result["imdb_rating"]} — [ссылка]({result["imdb_link"]})
 
-📎 Предложил: @{user.username}
-"""
+📎 Предложил: @{user.username}"""
+
         try:
             await update.message.reply_photo(
                 photo=result["poster_url"],
@@ -288,14 +300,14 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
             await status.delete()
-            logger.info("✅ Ответ с постером отправлен")
+            logger.info("✅ Ответ отправлен")
         except Exception as e:
-            logger.error(f"❌ Ошибка при отправке постера: {e}")
+            logger.error(f"❌ Ошибка отправки ответа: {e}")
             logger.error(traceback.format_exc())
-            await status.edit_text(caption + "\n\n⚠️ Постер не удалось загрузить", parse_mode="Markdown")
+            await status.edit_text(caption + "\n\n⚠️ Не удалось загрузить постер", parse_mode="Markdown")
             
     except Exception as e:
-        error_msg = f"❌ Произошла ошибка при обработке сообщения: {str(e)}"
+        error_msg = f"❌ Ошибка обработки сообщения: {str(e)}"
         logger.error(error_msg)
         logger.error(traceback.format_exc())
         await status.edit_text(error_msg)
@@ -306,8 +318,17 @@ async def run_bot():
         app = ApplicationBuilder().token(BOT_TOKEN).build()
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
         
+        # Добавляем обработчик сигналов для graceful shutdown
+        def signal_handler(signum, frame):
+            logger.info("🛑 Получен сигнал остановки")
+            asyncio.create_task(cleanup_database())
+            app.stop()
+        
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+        
         logger.info("🚀 Бот запущен")
-        await app.run_polling()
+        await app.run_polling(allowed_updates=Update.ALL_TYPES)
     except Exception as e:
         logger.error(f"❌ Критическая ошибка: {e}")
         logger.error(traceback.format_exc())
@@ -317,6 +338,8 @@ async def run_bot():
 if __name__ == "__main__":
     try:
         asyncio.run(run_bot())
+    except KeyboardInterrupt:
+        logger.info("👋 Бот остановлен пользователем")
     except Exception as e:
         logger.error(f"FATAL: {e}")
         logger.error(traceback.format_exc()) 
