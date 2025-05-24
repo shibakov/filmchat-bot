@@ -18,6 +18,7 @@ import asyncio
 from functools import partial
 import threading
 from datetime import datetime
+import aiohttp
 
 # Apply nest_asyncio to allow nested event loops
 nest_asyncio.apply()
@@ -25,7 +26,7 @@ nest_asyncio.apply()
 class TelegramLogHandler(logging.Handler):
     def __init__(self, bot_token, channel_id):
         super().__init__()
-        self.bot = Bot(bot_token)
+        self.bot_token = bot_token
         self.channel_id = channel_id
         self.queue = Queue()
         self.running = True
@@ -33,26 +34,40 @@ class TelegramLogHandler(logging.Handler):
         self.worker_thread.start()
         
     def _worker(self):
+        # Create event loop for this thread
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        # Create bot instance for this thread
+        bot = Bot(self.bot_token)
+        
+        async def send_message(msg):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    await bot.initialize(session)
+                    await bot.send_message(
+                        chat_id=self.channel_id,
+                        text=f"🤖 Log [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]:\n{msg}"
+                    )
+            except Exception as e:
+                print(f"Error sending log to Telegram: {e}")
+            finally:
+                await bot.shutdown()
+
         while self.running:
             try:
                 if not self.queue.empty():
                     msg = self.queue.get()
-                    # Create new event loop for this thread
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    # Send message
-                    loop.run_until_complete(
-                        self.bot.send_message(
-                            chat_id=self.channel_id,
-                            text=f"🤖 Log [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]:\n{msg}"
-                        )
-                    )
-                    loop.close()
+                    # Run message sending in the event loop
+                    loop.run_until_complete(send_message(msg))
             except Exception as e:
                 print(f"Error in log worker: {e}")
             finally:
                 # Small sleep to prevent CPU overuse
-                threading.Event().wait(0.1)
+                loop.run_until_complete(asyncio.sleep(0.1))
+        
+        # Cleanup
+        loop.close()
                 
     def emit(self, record):
         try:
