@@ -4,16 +4,25 @@ import openai
 import psycopg2
 import asyncio
 import signal
+import logging
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 from dotenv import load_dotenv
 from pathlib import Path
+
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
 # Загружаем .env только если файл существует
 env_path = Path('.env')
 if env_path.exists():
     load_dotenv()
 
+# Проверяем и получаем переменные окружения
 openai.api_key = os.getenv("OPENAI_API_KEY")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -21,33 +30,56 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not all([openai.api_key, BOT_TOKEN, DATABASE_URL]):
     raise ValueError("Необходимые переменные окружения не установлены")
 
-# Подключение к БД
-conn = psycopg2.connect(DATABASE_URL)
-cur = conn.cursor()
+# Глобальные переменные для БД
+conn = None
+cur = None
 
-# Таблица для фильмов
-cur.execute("""
-CREATE TABLE IF NOT EXISTS movies_info (
-    id SERIAL PRIMARY KEY,
-    original_message TEXT,
-    title TEXT,
-    year INT,
-    genres TEXT,
-    actors TEXT,
-    kinopoisk_rating FLOAT,
-    kinopoisk_link TEXT,
-    imdb_rating FLOAT,
-    imdb_link TEXT,
-    poster_url TEXT,
-    added_by TEXT,
-    chat_id BIGINT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-""")
-conn.commit()
+async def setup_database():
+    """Инициализация подключения к базе данных"""
+    global conn, cur
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur = conn.cursor()
+        
+        # Таблица для фильмов
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS movies_info (
+            id SERIAL PRIMARY KEY,
+            original_message TEXT,
+            title TEXT,
+            year INT,
+            genres TEXT,
+            actors TEXT,
+            kinopoisk_rating FLOAT,
+            kinopoisk_link TEXT,
+            imdb_rating FLOAT,
+            imdb_link TEXT,
+            poster_url TEXT,
+            added_by TEXT,
+            chat_id BIGINT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+        conn.commit()
+        logger.info("Database connection established and schema created")
+    except Exception as e:
+        logger.error(f"Database setup error: {e}")
+        raise
 
-# GPT-запрос
-async def analyze_film_text(text):
+async def cleanup_database():
+    """Закрытие соединения с базой данных"""
+    global conn, cur
+    try:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
+        logger.info("Database connections closed")
+    except Exception as e:
+        logger.error(f"Error closing database connections: {e}")
+
+async def analyze_film_text(text: str) -> dict:
+    """Анализ текста сообщения через GPT"""
     prompt = f"""
 Проанализируй это сообщение как предложение фильма и выдай результат в JSON. Если в тексте упоминается несколько фильмов, выбери первый:
 
@@ -77,36 +109,36 @@ async def analyze_film_text(text):
         )
         return json.loads(response.choices[0].message.content.strip())
     except openai.error.OpenAIError as e:
-        print(f"OpenAI API error: {e}")
+        logger.error(f"OpenAI API error: {e}")
         return {"error": "openai_error"}
     except json.JSONDecodeError as e:
-        print(f"JSON parsing error: {e}")
+        logger.error(f"JSON parsing error: {e}")
         return {"error": "invalid_json"}
     except Exception as e:
-        print(f"Unexpected error: {e}")
+        logger.error(f"Unexpected error in analyze_film_text: {e}")
         return {"error": "unknown_error"}
 
-# Обработка сообщений
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
+    """Обработчик входящих сообщений"""
+    if not update.message or not update.message.text:
         return
 
     text = update.message.text
     chat = update.effective_chat
     user = update.effective_user
 
-    # Проверяем, содержит ли сообщение ключевые слова о фильмах
+    # Проверяем ключевые слова
     if not any(k in text.lower() for k in ["фильм", "кино", "посмотреть", "рекомендую", "предлагаю", "советую", "movie", "film"]):
         return
 
-    # Отправляем сообщение о начале обработки
+    # Отправляем статус
     status_message = await update.message.reply_text(
         "🎬 Анализирую информацию о фильме...",
         quote=True
     )
 
     try:
-        # Получаем информацию о фильме через GPT
+        # Анализируем текст
         result = await analyze_film_text(text)
 
         if "error" in result:
@@ -119,7 +151,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status_message.edit_text(error_messages.get(result["error"], "❌ Произошла ошибка"))
             return
 
-        # Сохраняем информацию в базу
+        # Сохраняем в БД
         cur.execute("""
             INSERT INTO movies_info (
                 original_message, title, year, genres, actors,
@@ -143,7 +175,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ))
         conn.commit()
 
-        # Формируем красивое сообщение с информацией о фильме
+        # Формируем ответ
         caption = f"""🎬 *{result["title"]}* ({result["year"]})
 
 👥 *В ролях:*
@@ -158,83 +190,61 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 🎯 Предложил: @{user.username}"""
 
-        # Отправляем фото с описанием
         try:
             await update.message.reply_photo(
                 photo=result["poster_url"],
                 caption=caption,
                 parse_mode="Markdown"
             )
-            # Удаляем статус-сообщение после успешной отправки
             await status_message.delete()
         except Exception as e:
-            print(f"Error sending photo: {e}")
-            # Если не удалось отправить фото, отправляем только текст
+            logger.error(f"Error sending photo: {e}")
             await status_message.edit_text(
                 f"{caption}\n\n❗️ Не удалось загрузить постер фильма",
                 parse_mode="Markdown"
             )
 
     except Exception as e:
-        print(f"Error processing message: {e}")
+        logger.error(f"Error processing message: {e}")
         await status_message.edit_text("❌ Произошла ошибка при обработке сообщения")
 
-async def shutdown(app):
-    """Корректное завершение работы бота"""
-    print("Stopping bot...")
-    try:
-        if hasattr(app, 'running') and app.running:
-            await app.stop()
-    except Exception as e:
-        print(f"Error during shutdown: {e}")
-    finally:
-        try:
-            if 'cur' in globals() and cur:
-                cur.close()
-            if 'conn' in globals() and conn:
-                conn.close()
-        except Exception as e:
-            print(f"Error closing database connections: {e}")
-        print("Bot stopped successfully")
-
 async def run_bot():
-    """Запуск бота с обработкой сигналов"""
-    app = None
+    """Основная функция запуска бота"""
+    # Инициализируем бота
+    application = None
     try:
+        # Подключаемся к БД
+        await setup_database()
+        
         # Создаем приложение
-        app = ApplicationBuilder().token(BOT_TOKEN).build()
+        application = ApplicationBuilder().token(BOT_TOKEN).build()
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
         
-        # Добавляем обработчик сообщений
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
-        
-        # Настраиваем обработчики сигналов
-        loop = asyncio.get_running_loop()
-        for signal_type in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(
-                signal_type,
-                lambda: asyncio.create_task(shutdown(app))
-            )
-        
-        print("Starting bot...")
-        await app.initialize()
-        await app.start()
-        print("Bot is running...")
+        logger.info("Starting bot...")
+        await application.initialize()
+        await application.start()
+        logger.info("Bot is running...")
         
         # Запускаем бота
-        await app.run_polling(allowed_updates=Update.ALL_TYPES)
+        await application.run_polling(allowed_updates=Update.ALL_TYPES)
         
     except Exception as e:
-        print(f"Error starting bot: {e}")
-        if app:
-            await shutdown(app)
+        logger.error(f"Error in run_bot: {e}")
+        raise
     finally:
-        if app:
-            await shutdown(app)
+        if application and application.running:
+            logger.info("Stopping bot...")
+            await application.stop()
+        await cleanup_database()
 
-if __name__ == "__main__":
+def main():
+    """Точка входа"""
     try:
         asyncio.run(run_bot())
     except KeyboardInterrupt:
-        print("Bot stopped by user")
+        logger.info("Bot stopped by user")
     except Exception as e:
-        print(f"Fatal error: {e}") 
+        logger.error(f"Fatal error: {e}")
+
+if __name__ == "__main__":
+    main() 
