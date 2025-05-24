@@ -183,34 +183,38 @@ async def shutdown(app):
     """Корректное завершение работы бота"""
     print("Stopping bot...")
     try:
-        if app.running:
+        if hasattr(app, 'running') and app.running:
             await app.stop()
-        if app.initialized:
-            await app.shutdown()
+    except Exception as e:
+        print(f"Error during shutdown: {e}")
     finally:
-        if 'cur' in globals() and cur:
-            cur.close()
-        if 'conn' in globals() and conn:
-            conn.close()
+        try:
+            if 'cur' in globals() and cur:
+                cur.close()
+            if 'conn' in globals() and conn:
+                conn.close()
+        except Exception as e:
+            print(f"Error closing database connections: {e}")
         print("Bot stopped successfully")
 
 async def main():
     """Основная функция запуска бота"""
-    # Создаем приложение
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    
-    # Добавляем обработчик сообщений
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
-    
-    # Настраиваем корректное завершение работы
-    loop = asyncio.get_event_loop()
-    for signal_type in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(
-            signal_type,
-            lambda: asyncio.create_task(shutdown(app))
-        )
-    
+    app = None
     try:
+        # Создаем приложение
+        app = ApplicationBuilder().token(BOT_TOKEN).build()
+        
+        # Добавляем обработчик сообщений
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+        
+        # Настраиваем корректное завершение работы
+        loop = asyncio.get_event_loop()
+        for signal_type in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(
+                signal_type,
+                lambda: asyncio.create_task(shutdown(app))
+            )
+        
         print("Starting bot...")
         await app.initialize()
         await app.start()
@@ -218,9 +222,11 @@ async def main():
         await app.run_polling(stop_signals=None)
     except Exception as e:
         print(f"Error starting bot: {e}")
-        await shutdown(app)
+        if app:
+            await shutdown(app)
     finally:
-        await shutdown(app)
+        if app:
+            await shutdown(app)
 
 if __name__ == "__main__":
     try:
