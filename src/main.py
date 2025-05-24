@@ -183,10 +183,15 @@ async def shutdown(app):
     """Корректное завершение работы бота"""
     print("Stopping bot...")
     try:
-        await app.stop()
+        if app.running:
+            await app.stop()
+        if app.initialized:
+            await app.shutdown()
     finally:
-        cur.close()
-        conn.close()
+        if 'cur' in globals() and cur:
+            cur.close()
+        if 'conn' in globals() and conn:
+            conn.close()
         print("Bot stopped successfully")
 
 async def main():
@@ -209,9 +214,11 @@ async def main():
         print("Starting bot...")
         await app.initialize()
         await app.start()
+        print("Bot is running...")
         await app.run_polling(stop_signals=None)
     except Exception as e:
         print(f"Error starting bot: {e}")
+        await shutdown(app)
     finally:
         await shutdown(app)
 
