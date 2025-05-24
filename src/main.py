@@ -7,6 +7,7 @@ import logging
 import sys
 import signal
 import traceback
+import nest_asyncio
 from pathlib import Path
 from telegram import Update, Bot
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
@@ -15,6 +16,11 @@ from logging.handlers import QueueHandler
 from queue import Queue
 import asyncio
 from functools import partial
+import threading
+from datetime import datetime
+
+# Apply nest_asyncio to allow nested event loops
+nest_asyncio.apply()
 
 class TelegramLogHandler(logging.Handler):
     def __init__(self, bot_token, channel_id):
@@ -22,47 +28,44 @@ class TelegramLogHandler(logging.Handler):
         self.bot = Bot(bot_token)
         self.channel_id = channel_id
         self.queue = Queue()
-        self.task = None
+        self.running = True
+        self.worker_thread = threading.Thread(target=self._worker, daemon=True)
+        self.worker_thread.start()
         
+    def _worker(self):
+        while self.running:
+            try:
+                if not self.queue.empty():
+                    msg = self.queue.get()
+                    # Create new event loop for this thread
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    # Send message
+                    loop.run_until_complete(
+                        self.bot.send_message(
+                            chat_id=self.channel_id,
+                            text=f"🤖 Log [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]:\n{msg}"
+                        )
+                    )
+                    loop.close()
+            except Exception as e:
+                print(f"Error in log worker: {e}")
+            finally:
+                # Small sleep to prevent CPU overuse
+                threading.Event().wait(0.1)
+                
     def emit(self, record):
         try:
             msg = self.format(record)
             self.queue.put(msg)
-            
-            # Запускаем отправку асинхронно, если еще не запущена
-            if self.task is None or self.task.done():
-                self.task = asyncio.create_task(self.process_queue())
         except Exception:
             self.handleError(record)
-    
-    async def process_queue(self):
-        while not self.queue.empty():
-            messages = []
-            current_message = ""
             
-            # Собираем сообщения в пачки, не превышающие лимит Telegram
-            while not self.queue.empty():
-                msg = self.queue.get()
-                if len(current_message) + len(msg) + 2 > 4000:  # Лимит Telegram
-                    messages.append(current_message)
-                    current_message = msg
-                else:
-                    current_message += msg + "\n"
-            
-            if current_message:
-                messages.append(current_message)
-            
-            # Отправляем каждую пачку
-            for message in messages:
-                try:
-                    await self.bot.send_message(
-                        chat_id=self.channel_id,
-                        text=f"```\n{message}\n```",
-                        parse_mode='Markdown'
-                    )
-                except Exception as e:
-                    sys.stderr.write(f"Error sending log to Telegram: {e}\n")
-                await asyncio.sleep(0.5)  # Небольшая задержка между сообщениями
+    def close(self):
+        self.running = False
+        if self.worker_thread.is_alive():
+            self.worker_thread.join(timeout=2.0)
+        super().close()
 
 # Настройка логирования
 TELEGRAM_LOG_CHANNEL_ID = os.getenv("TELEGRAM_LOG_CHANNEL_ID")
@@ -302,8 +305,6 @@ async def run_bot():
         await cleanup_database()
 
 if __name__ == "__main__":
-    import nest_asyncio
-    nest_asyncio.apply()
     try:
         asyncio.run(run_bot())
     except Exception as e:
