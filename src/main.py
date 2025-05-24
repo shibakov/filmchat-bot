@@ -5,6 +5,7 @@ import psycopg2
 import asyncio
 import signal
 import logging
+import sys
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 from dotenv import load_dotenv
@@ -210,7 +211,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def run_bot():
     """Основная функция запуска бота"""
-    # Инициализируем бота
     application = None
     try:
         # Подключаемся к БД
@@ -232,17 +232,28 @@ async def run_bot():
         logger.error(f"Error in run_bot: {e}")
         raise
     finally:
-        if application and application.running:
-            logger.info("Stopping bot...")
-            await application.stop()
-        await cleanup_database()
+        try:
+            if application and application.running:
+                logger.info("Stopping bot...")
+                await application.stop()
+        except Exception as e:
+            logger.error(f"Error stopping bot: {e}")
+        finally:
+            await cleanup_database()
 
 def main():
     """Точка входа"""
     try:
+        # Настраиваем обработку сигналов
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(sig, lambda s, f: sys.exit(0))
+            
+        # Запускаем бота
         asyncio.run(run_bot())
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
+    except SystemExit:
+        logger.info("Bot stopped by system signal")
     except Exception as e:
         logger.error(f"Fatal error: {e}")
 
